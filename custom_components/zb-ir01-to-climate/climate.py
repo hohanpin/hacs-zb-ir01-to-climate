@@ -4,11 +4,10 @@ from homeassistant.components.climate.const import (
     FAN_AUTO, FAN_LOW, FAN_MEDIUM, FAN_HIGH,
     SWING_ON, SWING_OFF, SWING_VERTICAL, SWING_HORIZONTAL
 )
-
 from homeassistant.const import UnitOfTemperature, ATTR_TEMPERATURE
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import RestoreEntity
-
+from homeassistant.core import callback
 import asyncio
 import logging
 
@@ -63,42 +62,87 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     ir01_entity_id = discovery_info.get("ir01_entity_id")
     climate_name = discovery_info.get("climate_name")
     climate_id = discovery_info.get("climate_id")
-    async_add_entities([ZBACClimateEntity(hass, ir01_entity_id, climate_name, climate_id)])
+    temperature_sensor = discovery_info.get("temperature_sensor")
+    async_add_entities([ZBACClimateEntity(hass, ir01_entity_id, climate_name, climate_id, temperature_sensor)])
+
 
 class ZBACClimateEntity(ClimateEntity, RestoreEntity):
-
     _enable_turn_on_off_backwards_compatibility = False
 
-    def __init__(self, hass, ir01_entity_id, climate_name, climate_id):
+    def __init__(self, hass, ir01_entity_id, climate_name, climate_id, temperature_sensor=None):
         self.hass = hass
         self._ir01_entity_id = ir01_entity_id
         self._name = climate_name
+        # let registry assign entity_id; store requested id if provided
         self.entity_id = climate_id or None
         self._attr_temperature_unit = UnitOfTemperature.CELSIUS
-
         self._hvac_mode = HVACMode.OFF
         self._target_temperature = 26
         self._fan_mode = FAN_AUTO
         self._swing_mode = SWING_OFF
         self._last_command = ""
         self._last_received_command = ""
+        self._attr_current_temperature = None
+        self._temperature_sensor = temperature_sensor
 
-        # Subscribe to changes in the sensor
+        # Subscribe to changes in the IR last_received_command sensor
         self._sensor_unsub = async_track_state_change_event(
-            self.hass, "sensor." + self._ir01_entity_id + "_last_received_command", self.async_sensor_state_listener
+            self.hass,
+            "sensor." + self._ir01_entity_id + "_last_received_command",
+            self.async_sensor_state_listener,
         )
 
-    async def async_added_to_hass(self):
-        # Run when entity about to be added
-        await super().async_added_to_hass()
+        # Subscribe to external temperature sensor if provided
+        self._temp_unsub = None
+        if self._temperature_sensor:
+            self._temp_unsub = async_track_state_change_event(
+                self.hass,
+                [self._temperature_sensor],
+                self._handle_temp_event,
+            )
 
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
         # Restore state after a restart
         last_state = await self.async_get_last_state()
         if last_state:
-            self._hvac_mode = last_state.state
-            self._target_temperature = last_state.attributes.get('temperature')
-            self._fan_mode = last_state.attributes.get('fan_mode')
-            self._swing_mode = last_state.attributes.get('swing_mode')
+            # hvac_mode is a string; convert to HVACMode if possible
+            try:
+                self._hvac_mode = HVACMode(last_state.state)
+            except ValueError:
+                self._hvac_mode = HVACMode.OFF
+            self._target_temperature = last_state.attributes.get('temperature', self._target_temperature)
+            self._fan_mode = last_state.attributes.get('fan_mode', self._fan_mode)
+            self._swing_mode = last_state.attributes.get('swing_mode', self._swing_mode)
+            # restore current temperature if stored
+            ct = last_state.attributes.get('current_temperature')
+            if ct is not None:
+                try:
+                    self._attr_current_temperature = float(ct)
+                except (ValueError, TypeError):
+                    pass
+
+        # bootstrap current value from temp sensor
+        if self._temperature_sensor:
+            s = self.hass.states.get(self._temperature_sensor)
+            if s:
+                try:
+                    self._attr_current_temperature = float(s.state)
+                except (ValueError, TypeError):
+                    _LOGGER.debug("Temperature sensor %s has non-numeric state: %s", self._temperature_sensor, s.state)
+        self.async_write_ha_state()
+
+    @callback
+    def _handle_temp_event(self, event):
+        new_state = event.data.get("new_state")
+        if not new_state:
+            return
+        try:
+            value = float(new_state.state)
+        except (ValueError, TypeError):
+            return
+        self._attr_current_temperature = value
+        self.async_write_ha_state()
 
     async def async_sensor_state_listener(self, event):
         entity_id = event.data["entity_id"]
@@ -147,14 +191,24 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
         return list(code['swing'].keys())
 
     @property
+    def current_temperature(self):
+        return self._attr_current_temperature
+
+    @property
     def supported_features(self):
-        return ClimateEntityFeature.TURN_ON | ClimateEntityFeature.TURN_OFF | ClimateEntityFeature.TARGET_TEMPERATURE | ClimateEntityFeature.FAN_MODE | ClimateEntityFeature.SWING_MODE
+        return (
+            ClimateEntityFeature.TURN_ON
+            | ClimateEntityFeature.TURN_OFF
+            | ClimateEntityFeature.TARGET_TEMPERATURE
+            | ClimateEntityFeature.FAN_MODE
+            | ClimateEntityFeature.SWING_MODE
+        )
 
     def is_hex(self, val):
         try:
             int(val, 16)
             return True
-        except:
+        except Exception:
             return False
 
     def verify_checksum(self, data):
@@ -169,7 +223,7 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
                 calculated_checksum ^= byte
             # Compare the received checksum with the calculated checksum
             return received_checksum == calculated_checksum
-        except:
+        except Exception:
             # Handle invalid data format
             return False
 
@@ -183,13 +237,15 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
             mode = data[4:6]
             temp = data[6:8]
             fan = data[8:10]
+
             # Toshiba fix for fan mode: sample code received 08ff000603f2
             if power == 'ff' and mode == '00':
                 power = '00'
                 mode = '03'
             # MHI fix for minimum fan level: sample code received 0800000afffd
             if fan == 'ff':
-               fan = '01'
+                fan = '01'
+
             # validate parsed value
             if power != '00' and power != '01':
                 raise ValueError("Invalid power value.")
@@ -199,15 +255,17 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
                 raise ValueError("Invalid hvac mode value.")
             if not self.is_hex(fan) or not -1 < int(fan, 16) < 4:
                 raise ValueError("Invalid fan mode value.")
+
             # Set temperature and fan mode
             self._target_temperature = int(temp, 16) + 16
             self._fan_mode = self.fan_modes[int(fan, 16)]
+
             # Set HVAC mode
             if power == '01':
                 self._hvac_mode = HVACMode.OFF
             else:
                 hvac_mode_keys = list(code['mode'].keys())
-                self._hvac_mode = hvac_mode_keys[int(mode, 16)]
+                self._hvac_mode = HVACMode(hvac_mode_keys[int(mode, 16)]) if hvac_mode_keys else HVACMode.AUTO
             return True
         except Exception as e:
             _LOGGER.warning(f"Error parsing sensor data '{data}': {e}")
@@ -219,12 +277,12 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
         await self.hass.services.async_call(
             'text', 'set_value', {
                 "entity_id": "text." + self._ir01_entity_id + "_send_command",
-                "value": '"'+command+'"'
+                "value": '"' + command + '"'
             }
         )
         self._last_command = command  # You might want to store more specific state
         self.async_write_ha_state()  # Inform Home Assistant of state change
-    
+
     async def async_set_temperature(self, **kwargs):
         temperature = kwargs.get(ATTR_TEMPERATURE)
         if temperature is not None:
@@ -234,24 +292,26 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
                 await self.send_command(hex_code)
             else:
                 _LOGGER.warning(f"Error locating code with temperature '{temperature}'.")
-    
+
     async def async_set_hvac_mode(self, hvac_mode):
-        hex_code = code['mode'].get(hvac_mode)
+        # hvac_mode may be HVACMode or string
+        hv_mode_key = hvac_mode if isinstance(hvac_mode, str) else hvac_mode.value
+        hex_code = code['mode'].get(hv_mode_key)
         if not hex_code:
             _LOGGER.warning(f"Error locating code with hvac mode '{hvac_mode}'.")
             return
-        if self._hvac_mode == HVACMode.OFF and hvac_mode != HVACMode.OFF:
+        if self._hvac_mode == HVACMode.OFF and hv_mode_key != HVACMode.OFF.value:
             await self.send_command(code['power_on'])
             await asyncio.sleep(1)
-        self._hvac_mode = hvac_mode
+        self._hvac_mode = HVACMode(hv_mode_key)
         await self.send_command(hex_code)
 
     async def async_turn_on(self):
         await self.async_set_hvac_mode(HVACMode.AUTO)
-    
+
     async def async_turn_off(self):
         await self.async_set_hvac_mode(HVACMode.OFF)
-    
+
     async def async_set_fan_mode(self, fan_mode):
         hex_code = code['fan'].get(fan_mode, None)
         if hex_code:
@@ -272,3 +332,5 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
         # Unsubscribe from sensor's state changes when entity is removed
         if self._sensor_unsub:
             self._sensor_unsub()
+        if self._temp_unsub:
+            self._temp_unsub()
