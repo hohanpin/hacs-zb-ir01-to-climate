@@ -21,7 +21,7 @@ zb-ir01-to-climate:
   - ir01_entity_id: "0xf4b3b1fffe132df2"   # ZB-IR01 IEEE address or unique ID
     climate_id: "climate.my_ac"            # Optional: entity_id for the climate object
     climate_name: "My AC"                  # Display name
-    temperature_sensor: sensor.office_ac_temp_source  # Optional: sensor entity_id for current temperature
+    temperature_sensor: "sensor.office_ac_temp_source"  # Optional: sensor entity_id for current temperature
 ```
 
 ### Notes:
