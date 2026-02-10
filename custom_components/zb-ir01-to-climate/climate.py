@@ -63,13 +63,23 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
     climate_name = discovery_info.get("climate_name")
     climate_id = discovery_info.get("climate_id")
     temperature_sensor = discovery_info.get("temperature_sensor")
-    async_add_entities([ZBACClimateEntity(hass, ir01_entity_id, climate_name, climate_id, temperature_sensor)])
+    humidity_sensor = discovery_info.get("humidity_sensor")
+    async_add_entities([
+        ZBACClimateEntity(
+            hass,
+            ir01_entity_id,
+            climate_name,
+            climate_id,
+            temperature_sensor,
+            humidity_sensor,
+        )
+    ])
 
 
 class ZBACClimateEntity(ClimateEntity, RestoreEntity):
     _enable_turn_on_off_backwards_compatibility = False
 
-    def __init__(self, hass, ir01_entity_id, climate_name, climate_id, temperature_sensor=None):
+    def __init__(self, hass, ir01_entity_id, climate_name, climate_id, temperature_sensor=None, humidity_sensor=None):
         self.hass = hass
         self._ir01_entity_id = ir01_entity_id
         self._name = climate_name
@@ -84,6 +94,8 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
         self._last_received_command = ""
         self._attr_current_temperature = None
         self._temperature_sensor = temperature_sensor
+        self._attr_current_humidity = None
+        self._humidity_sensor = humidity_sensor
 
         # Subscribe to changes in the IR last_received_command sensor
         self._sensor_unsub = async_track_state_change_event(
@@ -99,6 +111,15 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
                 self.hass,
                 [self._temperature_sensor],
                 self._handle_temp_event,
+            )
+
+        # Subscribe to external humidity sensor if provided
+        self._humi_unsub = None
+        if self._humidity_sensor:
+            self._humi_unsub = async_track_state_change_event(
+                self.hass,
+                [self._humidity_sensor],
+                self._handle_humi_event,
             )
 
     async def async_added_to_hass(self):
@@ -121,6 +142,12 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
                     self._attr_current_temperature = float(ct)
                 except (ValueError, TypeError):
                     pass
+            ch = last_state.attributes.get('current_humidity')
+            if ch is not None:
+                try:
+                    self._attr_current_humidity = float(ch)
+                except (ValueError, TypeError):
+                    pass
 
         # bootstrap current value from temp sensor
         if self._temperature_sensor:
@@ -130,6 +157,14 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
                     self._attr_current_temperature = float(s.state)
                 except (ValueError, TypeError):
                     _LOGGER.debug("Temperature sensor %s has non-numeric state: %s", self._temperature_sensor, s.state)
+        # bootstrap current value from humidity sensor
+        if self._humidity_sensor:
+            s = self.hass.states.get(self._humidity_sensor)
+            if s:
+                try:
+                    self._attr_current_humidity = float(s.state)
+                except (ValueError, TypeError):
+                    _LOGGER.debug("Humidity sensor %s has non-numeric state: %s", self._humidity_sensor, s.state)
         self.async_write_ha_state()
 
     @callback
@@ -142,6 +177,18 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
         except (ValueError, TypeError):
             return
         self._attr_current_temperature = value
+        self.async_write_ha_state()
+
+    @callback
+    def _handle_humi_event(self, event):
+        new_state = event.data.get("new_state")
+        if not new_state:
+            return
+        try:
+            value = float(new_state.state)
+        except (ValueError, TypeError):
+            return
+        self._attr_current_humidity = value
         self.async_write_ha_state()
 
     async def async_sensor_state_listener(self, event):
@@ -193,6 +240,10 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
     @property
     def current_temperature(self):
         return self._attr_current_temperature
+
+    @property
+    def current_humidity(self):
+        return self._attr_current_humidity
 
     @property
     def supported_features(self):
@@ -334,3 +385,5 @@ class ZBACClimateEntity(ClimateEntity, RestoreEntity):
             self._sensor_unsub()
         if self._temp_unsub:
             self._temp_unsub()
+        if self._humi_unsub:
+            self._humi_unsub()

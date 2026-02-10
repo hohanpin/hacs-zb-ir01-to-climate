@@ -1,11 +1,12 @@
 # ZB-IR01 to Climate Integration for Home Assistant
 
 The HA climate object created by EasyIoT ZB-IR01 with status feedback.
-This is a Home Assistant custom integration that creates a `climate` entity and can sync an external temperature sensor value to `current_temperature`.
+This is a Home Assistant custom integration that creates a `climate` entity and can sync external temperature/humidity sensor values to `current_temperature` and `current_humidity`.
 
 ## Features
 - Control HVAC modes, target temperature, fan speed, and swing via IR codes.
 - Sync real-time temperature from any Home Assistant sensor using `temperature_sensor` option.
+- Sync real-time humidity from any Home Assistant sensor using `humidity_sensor` option.
 
 ## Installation
 Copy this folder to `<config_dir>/custom_components/zb-ir01-to-climate/`.
@@ -22,10 +23,12 @@ zb-ir01-to-climate:
     climate_id: "climate.my_ac"            # Optional: entity_id for the climate object
     climate_name: "My AC"                  # Display name
     temperature_sensor: "sensor.office_ac_temp_source"  # Optional: sensor entity_id for current temperature
+    humidity_sensor: "sensor.office_ac_humi_source"
 ```
 
 ### Notes:
 - `temperature_sensor` should point to a sensor with numeric state and unit °C.
+- `humidity_sensor` should point to a sensor with numeric state and unit %.
 - If your Zigbee sensor reports °F or includes text, create a Template Sensor to convert it:
 
 ```yaml
